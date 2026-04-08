@@ -1,75 +1,122 @@
 """
-Google Photos handlers — albums, media items, download to bot/channel.
+Google Photos handlers — browse images/videos via Google Drive API.
+(Google Photos Library API was shut down in 2025.)
 """
 
 import logging
 import os
+from datetime import datetime, timezone, timedelta
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, URLInputFile
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 )
 
 from config import config
 from services.google_auth import auth_service
-from services.google_photos import GooglePhotosService
+from services.google_drive import GoogleDriveService
+from services.file_utils import generate_caption, max_upload_bytes
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 
-def albums_keyboard(albums: list[dict], next_token: str | None) -> InlineKeyboardMarkup:
+class PhotoSearchState(StatesGroup):
+    waiting_for_query = State()
+
+
+# ─── Page token cache ─────────────────────────────────────────────────────────
+_token_cache: dict[str, str] = {}
+_token_counter = 0
+
+
+def _store(token: str) -> str:
+    global _token_counter
+    _token_counter += 1
+    key = str(_token_counter)
+    _token_cache[key] = token
+    return key
+
+
+def _pop(key: str) -> str | None:
+    return _token_cache.pop(key, None)
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _emoji(mime: str) -> str:
+    return "🎬" if "video" in mime else "🖼️"
+
+
+def _since_iso(days: int) -> str:
+    dt = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _files_keyboard(
+    files: list[dict],
+    next_token: str | None,
+    back_cb: str = "photos_menu",
+) -> InlineKeyboardMarkup:
     buttons = []
-    for album in albums:
-        aid = album["id"]
-        title = album.get("title", "Без названия")[:40]
-        count = album.get("mediaItemsCount", "?")
+    for f in files:
+        name = f["name"][:38]
         buttons.append([InlineKeyboardButton(
-            text=f"🗂 {title} ({count})",
-            callback_data=f"photos_album:{aid}",
+            text=f"{_emoji(f.get('mimeType', ''))} {name}",
+            callback_data=f"photo_file:{f['id']}",
         )])
     nav = []
     if next_token:
-        nav.append(InlineKeyboardButton(text="➡️ Ещё", callback_data=f"photos_albums_next:{next_token}"))
-    nav.append(InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main"))
+        key = _store(next_token)
+        nav.append(InlineKeyboardButton(text="➡️ Ещё", callback_data=f"photos_page:{key}:{back_cb}"))
+    nav.append(InlineKeyboardButton(text="🔙 Назад", callback_data=back_cb))
     buttons.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def media_keyboard(items: list[dict], album_id: str, next_token: str | None) -> InlineKeyboardMarkup:
-    buttons = []
-    for item in items:
-        iid = item["id"]
-        filename = item.get("filename", "photo")[:35]
-        mtype = item.get("mediaMetadata", {})
-        emoji = "🎬" if "video" in item.get("mimeType", "") else "🖼️"
-        buttons.append([InlineKeyboardButton(
-            text=f"{emoji} {filename}",
-            callback_data=f"photos_item:{iid}",
-        )])
-    nav = []
-    if next_token:
-        nav.append(InlineKeyboardButton(
-            text="➡️ Ещё",
-            callback_data=f"photos_album_next:{album_id}:{next_token}",
-        ))
-    nav.append(InlineKeyboardButton(text="⬅️ Альбомы", callback_data="photos_albums"))
-    buttons.append(nav)
+def _file_action_keyboard(file_id: str, web_link: str | None) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="⬇️ Скачать мне", callback_data=f"photo_download:{file_id}")],
+        [InlineKeyboardButton(text="📤 В канал", callback_data=f"photo_to_channel:{file_id}")],
+    ]
+    if web_link:
+        buttons.append([InlineKeyboardButton(text="🌐 Открыть в браузере", url=web_link)])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="photos_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def item_action_keyboard(item_id: str) -> InlineKeyboardMarkup:
+def _photos_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬇️ Скачать мне", callback_data=f"photos_download:{item_id}")],
-        [InlineKeyboardButton(text="📤 В канал", callback_data=f"photos_to_channel:{item_id}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="photos_albums")],
+        [
+            InlineKeyboardButton(text="🖼️ Фото", callback_data="photos_filter:image"),
+            InlineKeyboardButton(text="🎬 Видео", callback_data="photos_filter:video"),
+            InlineKeyboardButton(text="🗂 Всё", callback_data="photos_filter:all"),
+        ],
+        [InlineKeyboardButton(text="📁 По папкам", callback_data="photos_folders")],
+        [InlineKeyboardButton(text="📅 По дате", callback_data="photos_dates")],
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="photos_search")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
     ])
 
 
+def _dates_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Сегодня", callback_data="photos_date:1")],
+        [InlineKeyboardButton(text="📅 Последние 7 дней", callback_data="photos_date:7")],
+        [InlineKeyboardButton(text="📅 Последние 30 дней", callback_data="photos_date:30")],
+        [InlineKeyboardButton(text="📅 Последние 365 дней", callback_data="photos_date:365")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="photos_menu")],
+    ])
+
+
+# ─── Main menu ────────────────────────────────────────────────────────────────
+
 @router.message(Command("photos"))
 @router.callback_query(F.data == "photos_albums")
-async def show_albums(event: Message | CallbackQuery):
+@router.callback_query(F.data == "photos_menu")
+async def show_photos_menu(event: Message | CallbackQuery):
     user_id = event.from_user.id
     creds = auth_service.get_credentials(user_id)
     if not creds:
@@ -80,20 +127,8 @@ async def show_albums(event: Message | CallbackQuery):
             await event.answer(text)
         return
 
-    photos = GooglePhotosService(creds)
-    result = photos.list_albums(page_size=15)
-    albums = result.get("albums", [])
-    next_token = result.get("nextPageToken")
-
-    if not albums:
-        text = "🖼️ <b>Google Фото</b>\n\n<i>Альбомы не найдены.</i>"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")
-        ]])
-    else:
-        text = f"🖼️ <b>Ваши альбомы</b> ({len(albums)} из {len(albums)}):"
-        kb = albums_keyboard(albums, next_token)
-
+    text = "🖼️ <b>Фото и видео</b>\n\nВыберите режим просмотра:"
+    kb = _photos_main_menu()
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         await event.answer()
@@ -101,128 +136,351 @@ async def show_albums(event: Message | CallbackQuery):
         await event.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-@router.callback_query(F.data.startswith("photos_albums_next:"))
-async def albums_next_page(call: CallbackQuery):
-    token = call.data.split(":", 1)[1]
+# ─── Filter: all / image / video ──────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("photos_filter:"))
+async def photos_by_filter(call: CallbackQuery):
+    mime_filter = call.data.split(":")[1]  # all | image | video
     creds = auth_service.get_credentials(call.from_user.id)
-    photos = GooglePhotosService(creds)
-    result = photos.list_albums(page_size=15, page_token=token)
-    albums = result.get("albums", [])
-    next_token = result.get("nextPageToken")
-    text = f"🖼️ <b>Альбомы (продолжение)</b>:"
-    await call.message.edit_text(text, reply_markup=albums_keyboard(albums, next_token), parse_mode="HTML")
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("photos_album:"))
-async def show_album_items(call: CallbackQuery):
-    album_id = call.data.split(":")[1]
-    creds = auth_service.get_credentials(call.from_user.id)
-    photos = GooglePhotosService(creds)
-
-    album = photos.get_album(album_id)
-    title = album.get("title", "Альбом")
-    result = photos.list_media_in_album(album_id, page_size=15)
-    items = result.get("mediaItems", [])
+    drive = GoogleDriveService(creds)
+    result = drive.list_images(page_size=15, mime_filter=None if mime_filter == "all" else mime_filter)
+    files = result.get("files", [])
     next_token = result.get("nextPageToken")
 
-    if not items:
-        text = f"🗂 <b>{title}</b>\n\n<i>Альбом пуст.</i>"
+    labels = {"image": "🖼️ Фото", "video": "🎬 Видео", "all": "🗂 Все медиафайлы"}
+    title = labels.get(mime_filter, "Медиафайлы")
+
+    if not files:
+        text = f"{title}\n\n<i>Файлы не найдены.</i>"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ Альбомы", callback_data="photos_albums")
+            InlineKeyboardButton(text="🔙 Назад", callback_data="photos_menu")
         ]])
     else:
-        text = f"🗂 <b>{title}</b>\n\nФайлов: {len(items)}"
-        kb = media_keyboard(items, album_id, next_token)
+        text = f"<b>{title}</b>\n\nПоследние файлы:"
+        kb = _files_keyboard(files, next_token, back_cb="photos_menu")
 
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("photos_album_next:"))
-async def album_next_page(call: CallbackQuery):
-    _, album_id, token = call.data.split(":", 2)
-    creds = auth_service.get_credentials(call.from_user.id)
-    photos = GooglePhotosService(creds)
-    result = photos.list_media_in_album(album_id, page_size=15, page_token=token)
-    items = result.get("mediaItems", [])
-    next_token = result.get("nextPageToken")
-    text = "🗂 <b>Ещё файлы</b>"
-    await call.message.edit_text(text, reply_markup=media_keyboard(items, album_id, next_token), parse_mode="HTML")
-    await call.answer()
+# ─── By date ─────────────────────────────────────────────────────────────────
 
-
-@router.callback_query(F.data.startswith("photos_item:"))
-async def show_media_item(call: CallbackQuery):
-    item_id = call.data.split(":")[1]
-    creds = auth_service.get_credentials(call.from_user.id)
-    photos = GooglePhotosService(creds)
-    item = photos.get_media_item(item_id)
-    meta = item.get("mediaMetadata", {})
-    filename = item.get("filename", "photo")
-    created = meta.get("creationTime", "—")[:10]
-    width = meta.get("width", "?")
-    height = meta.get("height", "?")
-
-    text = (
-        f"🖼️ <b>{filename}</b>\n\n"
-        f"Дата: {created}\n"
-        f"Размер: {width}×{height}\n"
-    )
-    # Send thumbnail preview
-    thumb_url = photos.get_download_url(item["baseUrl"], width=400, height=400)
-    await call.message.answer_photo(
-        URLInputFile(thumb_url, filename=filename),
-        caption=text,
-        reply_markup=item_action_keyboard(item_id),
+@router.callback_query(F.data == "photos_dates")
+async def photos_dates_menu(call: CallbackQuery):
+    await call.message.edit_text(
+        "📅 <b>Фильтр по дате</b>\n\nВыберите период:",
+        reply_markup=_dates_menu(),
         parse_mode="HTML",
     )
     await call.answer()
 
 
-async def _send_photo_item(bot: Bot, chat_id: str | int, item: dict, creds):
-    photos_svc = GooglePhotosService(creds)
-    filename = item.get("filename", "photo.jpg")
-    local_path = os.path.join(config.TEMP_DIR, filename)
-    photos_svc.download_media(item["baseUrl"], local_path)
+@router.callback_query(F.data.startswith("photos_date:"))
+async def photos_by_date(call: CallbackQuery):
+    days = int(call.data.split(":")[1])
+    creds = auth_service.get_credentials(call.from_user.id)
+    drive = GoogleDriveService(creds)
+    result = drive.list_images(page_size=15, since_date=_since_iso(days))
+    files = result.get("files", [])
+    next_token = result.get("nextPageToken")
 
-    mime = item.get("mimeType", "image/jpeg")
-    caption = f"📸 {filename}"
+    labels = {1: "сегодня", 7: "за 7 дней", 30: "за 30 дней", 365: "за год"}
+    title = f"📅 Медиафайлы {labels.get(days, f'за {days} дней')}"
+
+    if not files:
+        text = f"<b>{title}</b>\n\n<i>Файлы не найдены.</i>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 Назад", callback_data="photos_dates")
+        ]])
+    else:
+        text = f"<b>{title}</b>:"
+        kb = _files_keyboard(files, next_token, back_cb="photos_dates")
+
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+# ─── By folder ────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "photos_folders")
+async def photos_folders(call: CallbackQuery):
+    creds = auth_service.get_credentials(call.from_user.id)
+    drive = GoogleDriveService(creds)
+    result = drive.list_folders(page_size=20)
+    folders = result.get("files", [])
+    next_token = result.get("nextPageToken")
+
+    if not folders:
+        await call.message.edit_text(
+            "📁 <b>Папки</b>\n\n<i>Папки не найдены.</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Назад", callback_data="photos_menu")
+            ]]),
+            parse_mode="HTML",
+        )
+        await call.answer()
+        return
+
+    buttons = []
+    for f in folders:
+        buttons.append([InlineKeyboardButton(
+            text=f"📁 {f['name'][:40]}",
+            callback_data=f"photos_in_folder:{f['id']}",
+        )])
+    nav = []
+    if next_token:
+        key = _store(next_token)
+        nav.append(InlineKeyboardButton(text="➡️ Ещё", callback_data=f"photos_folders_page:{key}"))
+    nav.append(InlineKeyboardButton(text="🔙 Назад", callback_data="photos_menu"))
+    buttons.append(nav)
+
+    await call.message.edit_text(
+        "📁 <b>Папки</b>\n\nВыберите папку:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("photos_folders_page:"))
+async def photos_folders_next(call: CallbackQuery):
+    token_key = call.data.split(":")[1]
+    token = _pop(token_key)
+    if not token:
+        await call.answer("Страница устарела.", show_alert=True)
+        return
+    creds = auth_service.get_credentials(call.from_user.id)
+    drive = GoogleDriveService(creds)
+    result = drive.list_folders(page_size=20, page_token=token)
+    folders = result.get("files", [])
+    next_token = result.get("nextPageToken")
+
+    buttons = []
+    for f in folders:
+        buttons.append([InlineKeyboardButton(
+            text=f"📁 {f['name'][:40]}",
+            callback_data=f"photos_in_folder:{f['id']}",
+        )])
+    nav = []
+    if next_token:
+        key = _store(next_token)
+        nav.append(InlineKeyboardButton(text="➡️ Ещё", callback_data=f"photos_folders_page:{key}"))
+    nav.append(InlineKeyboardButton(text="🔙 Назад", callback_data="photos_menu"))
+    buttons.append(nav)
+
+    await call.message.edit_text(
+        "📁 <b>Папки (продолжение)</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("photos_in_folder:"))
+async def photos_in_folder(call: CallbackQuery):
+    folder_id = call.data.split(":")[1]
+    creds = auth_service.get_credentials(call.from_user.id)
+    drive = GoogleDriveService(creds)
+
+    folder_meta = drive.get_file_metadata(folder_id)
+    folder_name = folder_meta.get("name", "Папка")
+
+    result = drive.list_images(page_size=15, folder_id=folder_id)
+    files = result.get("files", [])
+    next_token = result.get("nextPageToken")
+
+    if not files:
+        text = f"📁 <b>{folder_name}</b>\n\n<i>Медиафайлы не найдены.</i>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 К папкам", callback_data="photos_folders")
+        ]])
+    else:
+        text = f"📁 <b>{folder_name}</b>\n\nФайлов: {len(files)}+"
+        kb = _files_keyboard(files, next_token, back_cb="photos_folders")
+
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+# ─── Pagination (generic) ─────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("photos_page:"))
+async def photos_next_page(call: CallbackQuery):
+    parts = call.data.split(":", 2)
+    token_key = parts[1]
+    back_cb = parts[2] if len(parts) > 2 else "photos_menu"
+    token = _pop(token_key)
+    if not token:
+        await call.answer("Страница устарела, обновите список.", show_alert=True)
+        return
+    creds = auth_service.get_credentials(call.from_user.id)
+    drive = GoogleDriveService(creds)
+    result = drive.list_images(page_size=15, page_token=token)
+    files = result.get("files", [])
+    next_token = result.get("nextPageToken")
+    await call.message.edit_text(
+        "🗂 <b>Медиафайлы (продолжение)</b>",
+        reply_markup=_files_keyboard(files, next_token, back_cb=back_cb),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+# ─── Search ──────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "photos_search")
+async def photos_search_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PhotoSearchState.waiting_for_query)
+    await call.message.edit_text(
+        "🔍 <b>Поиск фото и видео</b>\n\nВведите название файла:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="photos_menu")
+        ]]),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.message(PhotoSearchState.waiting_for_query)
+async def photos_search_execute(message: Message, state: FSMContext):
+    await state.clear()
+    query = message.text.strip()
+    creds = auth_service.get_credentials(message.from_user.id)
+    drive = GoogleDriveService(creds)
+    result = drive.list_images(page_size=15, name_query=query)
+    files = result.get("files", [])
+    next_token = result.get("nextPageToken")
+
+    if not files:
+        await message.answer(
+            f"🔍 По запросу «{query}» ничего не найдено.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Назад", callback_data="photos_menu")
+            ]]),
+        )
+    else:
+        await message.answer(
+            f"🔍 <b>Результаты для «{query}»</b>:",
+            reply_markup=_files_keyboard(files, next_token, back_cb="photos_menu"),
+            parse_mode="HTML",
+        )
+
+
+# ─── File info & actions ─────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("photo_file:"))
+async def show_photo_info(call: CallbackQuery):
+    file_id = call.data.split(":")[1]
+    creds = auth_service.get_credentials(call.from_user.id)
+    if not creds:
+        await call.answer("Нет авторизации", show_alert=True)
+        return
+    drive = GoogleDriveService(creds)
+    meta = drive.get_file_metadata(file_id)
+    name = meta["name"]
+    mime = meta.get("mimeType", "—")
+    modified = meta.get("modifiedTime", "—")[:10]
+    size_bytes = meta.get("size")
+    size_str = f"{int(size_bytes) // 1024} KB" if size_bytes else "—"
+
+    text = (
+        f"{_emoji(mime)} <b>{name}</b>\n\n"
+        f"Тип: <code>{mime}</code>\n"
+        f"Размер: {size_str}\n"
+        f"Изменён: {modified}"
+    )
+    await call.message.edit_text(
+        text,
+        reply_markup=_file_action_keyboard(file_id, meta.get("webViewLink")),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+async def _send_media(bot: Bot, chat_id: int | str, drive: GoogleDriveService, file_id: str):
+    meta = drive.get_file_metadata(file_id)
+    name = meta["name"]
+    size = int(meta.get("size", 0))
+    if size > 50 * 1024 * 1024:
+        raise ValueError("Файл больше 50 MB — Telegram не позволяет его отправить.")
+    local_path = os.path.join(config.TEMP_DIR, name)
     try:
+        drive.download_file(file_id, local_path)
+        mime = meta.get("mimeType", "")
         if "video" in mime:
-            await bot.send_video(chat_id, FSInputFile(local_path, filename=filename), caption=caption)
+            await bot.send_video(chat_id, FSInputFile(local_path, filename=name), caption=f"🎬 {name}")
         else:
-            await bot.send_photo(chat_id, FSInputFile(local_path, filename=filename), caption=caption)
+            await bot.send_photo(chat_id, FSInputFile(local_path, filename=name), caption=f"🖼️ {name}")
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)
 
 
-@router.callback_query(F.data.startswith("photos_download:"))
+@router.callback_query(F.data.startswith("photo_download:"))
 async def download_photo(call: CallbackQuery, bot: Bot):
-    item_id = call.data.split(":")[1]
+    file_id = call.data.split(":")[1]
     creds = auth_service.get_credentials(call.from_user.id)
     if not creds:
         await call.answer("Нет авторизации", show_alert=True)
         return
     await call.answer("⏳ Скачиваю...")
-    photos_svc = GooglePhotosService(creds)
-    item = photos_svc.get_media_item(item_id)
-    await _send_photo_item(bot, call.from_user.id, item, creds)
+    drive = GoogleDriveService(creds)
+    try:
+        await _send_media(bot, call.from_user.id, drive, file_id)
+    except ValueError as e:
+        await call.message.answer(f"❌ {e}")
 
 
-@router.callback_query(F.data.startswith("photos_to_channel:"))
+@router.callback_query(F.data.startswith("photo_to_channel:"))
 async def photo_to_channel(call: CallbackQuery, bot: Bot):
-    if not config.TELEGRAM_CHANNEL_ID:
-        await call.answer("❌ TELEGRAM_CHANNEL_ID не настроен", show_alert=True)
+    from services.scheduler import get_scheduler
+    user_id = call.from_user.id
+    sched = get_scheduler(bot)
+    channel_id = sched.get_channel_id(user_id)
+    if not channel_id:
+        await call.answer("❌ Канал не выбран. Настройте в /sync", show_alert=True)
         return
-    item_id = call.data.split(":")[1]
-    creds = auth_service.get_credentials(call.from_user.id)
+    file_id = call.data.split(":")[1]
+    creds = auth_service.get_credentials(user_id)
     if not creds:
         await call.answer("Нет авторизации", show_alert=True)
         return
-    await call.answer("⏳ Публикую в канал...")
-    photos_svc = GooglePhotosService(creds)
-    item = photos_svc.get_media_item(item_id)
-    await _send_photo_item(bot, config.TELEGRAM_CHANNEL_ID, item, creds)
-    await call.message.answer("✅ Фото опубликовано в канале!")
+    drive = GoogleDriveService(creds)
+    meta = drive.get_file_metadata(file_id)
+    size = int(meta.get("size", 0))
+    mime = meta.get("mimeType", "")
+    limit = max_upload_bytes()
+
+    if size <= limit:
+        await call.answer("⏳ Публикую...")
+        await sched._post_file_to_channel(drive, meta, channel_id, sched.get_send_mode(user_id))
+        await call.message.answer("✅ Файл опубликован в канале!")
+        return
+
+    # Too large — offer options
+    size_mb = size // (1024 * 1024)
+    limit_mb = limit // (1024 * 1024)
+    is_media = mime.startswith(MIME_IMAGE) or mime.startswith(MIME_VIDEO)
+    buttons = []
+    if is_media:
+        buttons.append([InlineKeyboardButton(
+            text="🖼 Сжать и отправить как медиа",
+            callback_data=f"post_large_compress:{file_id}",
+        )])
+    buttons.append([InlineKeyboardButton(
+        text="📦 Разбить на архивы",
+        callback_data=f"post_large_archive:{file_id}",
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="🔗 Только ссылка на Drive",
+        callback_data=f"post_large_link:{file_id}",
+    )])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="photos_menu")])
+
+    await call.message.answer(
+        f"⚠️ <b>{meta['name']}</b>\n"
+        f"Размер {size_mb} MB превышает лимит {limit_mb} MB.\n\nКак отправить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+    await call.answer()

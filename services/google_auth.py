@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/photoslibrary.readonly",
 ]
 
 CLIENT_CONFIG = {
@@ -58,7 +57,6 @@ class GoogleAuthService:
         flow.redirect_uri = config.GOOGLE_REDIRECT_URI
         auth_url, _ = flow.authorization_url(
             access_type="offline",
-            include_granted_scopes="true",
             prompt="consent",
         )
         logger.info(f"Auth URL scopes requested: {SCOPES}")
@@ -84,7 +82,7 @@ class GoogleAuthService:
                 return False
             code = codes[0]
         try:
-            flow.fetch_token(code=code)
+            flow.fetch_token(code=code, check_scopes=False)
             creds = flow.credentials
             logger.info(f"Token scopes after exchange: {creds.scopes}")
             self._tokens[user_id] = {

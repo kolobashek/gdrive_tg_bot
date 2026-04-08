@@ -102,6 +102,54 @@ class GoogleDriveService:
     def delete_file(self, file_id: str):
         self.service.files().delete(fileId=file_id).execute()
 
+    def list_images(
+        self,
+        page_size: int = 20,
+        page_token: str | None = None,
+        mime_filter: str | None = None,
+        name_query: str | None = None,
+        since_date: str | None = None,
+        folder_id: str | None = None,
+    ) -> dict:
+        """List image/video files with optional filters."""
+        if mime_filter == "image":
+            mime_q = "mimeType contains 'image/'"
+        elif mime_filter == "video":
+            mime_q = "mimeType contains 'video/'"
+        else:
+            mime_q = "(mimeType contains 'image/' or mimeType contains 'video/')"
+
+        q_parts = [mime_q, "trashed = false"]
+        if name_query:
+            safe = name_query.replace("'", "\\'")
+            q_parts.append(f"name contains '{safe}'")
+        if since_date:
+            q_parts.append(f"modifiedTime > '{since_date}'")
+        if folder_id:
+            q_parts.append(f"'{folder_id}' in parents")
+
+        params = dict(
+            q=" and ".join(q_parts),
+            pageSize=page_size,
+            fields=f"nextPageToken, files({FILE_FIELDS})",
+            orderBy="modifiedTime desc",
+        )
+        if page_token:
+            params["pageToken"] = page_token
+        return self.service.files().list(**params).execute()
+
+    def list_folders(self, page_size: int = 20, page_token: str | None = None) -> dict:
+        """List all folders in Drive."""
+        params = dict(
+            q="mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+            pageSize=page_size,
+            fields=f"nextPageToken, files(id, name, modifiedTime)",
+            orderBy="modifiedTime desc",
+        )
+        if page_token:
+            params["pageToken"] = page_token
+        return self.service.files().list(**params).execute()
+
     def list_new_files_since(self, folder_id: str, since_token: str | None) -> tuple[list[dict], str]:
         """
         Returns (new_files, new_page_token).

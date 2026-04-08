@@ -16,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from config import config
 from services.google_auth import auth_service
 from services.google_drive import GoogleDriveService, MIME_FOLDER
+from services.file_utils import generate_caption, max_upload_bytes, split_into_zips
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -239,24 +240,107 @@ async def download_file(call: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("drive_to_channel:"))
 async def post_to_channel(call: CallbackQuery, bot: Bot):
-    if not config.TELEGRAM_CHANNEL_ID:
-        await call.answer("❌ TELEGRAM_CHANNEL_ID не настроен", show_alert=True)
+    from services.scheduler import get_scheduler
+    user_id = call.from_user.id
+    sched = get_scheduler(bot)
+    if not sched.get_channel_id(user_id):
+        await call.answer("❌ Канал не выбран. Настройте в /sync", show_alert=True)
         return
     file_id = call.data.split(":")[1]
-    user_id = call.from_user.id
     creds = auth_service.get_credentials(user_id)
     if not creds:
         await call.answer("Нет авторизации", show_alert=True)
         return
 
-    await call.answer("⏳ Публикую в канал...")
-    from services.scheduler import get_scheduler
+    drive = GoogleDriveService(creds)
+    meta = drive.get_file_metadata(file_id)
+    size = int(meta.get("size", 0))
+    mime = meta.get("mimeType", "")
+    limit = max_upload_bytes()
+
+    if size <= limit:
+        await call.answer("⏳ Публикую...")
+        ok = await sched.manual_post_file(bot, file_id, user_id)
+        await call.message.answer("✅ Файл опубликован!" if ok else "❌ Ошибка публикации.")
+        return
+
+    # File too large — offer options
+    size_mb = size // (1024 * 1024)
+    limit_mb = limit // (1024 * 1024)
+    is_media = mime.startswith("image/") or mime.startswith("video/")
+
+    buttons = []
+    if is_media:
+        buttons.append([InlineKeyboardButton(
+            text="🖼 Сжать и отправить как медиа",
+            callback_data=f"post_large_compress:{file_id}",
+        )])
+    buttons.append([InlineKeyboardButton(
+        text="📦 Разбить на архивы и отправить",
+        callback_data=f"post_large_archive:{file_id}",
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="🔗 Только ссылка на Drive",
+        callback_data=f"post_large_link:{file_id}",
+    )])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="drive_root")])
+
+    await call.message.answer(
+        f"⚠️ <b>{meta['name']}</b>\n"
+        f"Размер {size_mb} MB превышает лимит {limit_mb} MB.\n\n"
+        "Как отправить в канал?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("post_large_compress:"))
+async def post_large_compress(call: CallbackQuery, bot: Bot):
+    from services.scheduler import get_scheduler, SEND_MODE_COMPRESSED
+    file_id = call.data.split(":")[1]
+    user_id = call.from_user.id
+    creds = auth_service.get_credentials(user_id)
     sched = get_scheduler(bot)
-    ok = await sched.manual_post_file(bot, file_id, user_id)
-    if ok:
-        await call.message.answer("✅ Файл опубликован в канале!")
-    else:
-        await call.message.answer("❌ Не удалось опубликовать файл.")
+    channel_id = sched.get_channel_id(user_id)
+    drive = GoogleDriveService(creds)
+    meta = drive.get_file_metadata(file_id)
+    await call.answer("⏳ Отправляю...")
+    await sched._post_file_to_channel(drive, meta, channel_id, SEND_MODE_COMPRESSED)
+    await call.message.answer("✅ Отправлено как сжатое медиа!")
+
+
+@router.callback_query(F.data.startswith("post_large_archive:"))
+async def post_large_archive(call: CallbackQuery, bot: Bot):
+    from services.scheduler import get_scheduler
+    file_id = call.data.split(":")[1]
+    user_id = call.from_user.id
+    creds = auth_service.get_credentials(user_id)
+    sched = get_scheduler(bot)
+    channel_id = sched.get_channel_id(user_id)
+    drive = GoogleDriveService(creds)
+    meta = drive.get_file_metadata(file_id)
+    await call.answer("⏳ Архивирую и отправляю...")
+    await sched.post_as_archive(bot, drive, meta, channel_id)
+    await call.message.answer("✅ Архив отправлен!")
+
+
+@router.callback_query(F.data.startswith("post_large_link:"))
+async def post_large_link(call: CallbackQuery, bot: Bot):
+    from services.scheduler import get_scheduler
+    from services.file_utils import generate_caption
+    file_id = call.data.split(":")[1]
+    user_id = call.from_user.id
+    creds = auth_service.get_credentials(user_id)
+    sched = get_scheduler(bot)
+    channel_id = sched.get_channel_id(user_id)
+    drive = GoogleDriveService(creds)
+    meta = drive.get_file_metadata(file_id)
+    caption = generate_caption(meta)
+    web_link = meta.get("webViewLink", "")
+    await bot.send_message(channel_id, f"{caption}\n🔗 {web_link}", parse_mode="HTML")
+    await call.answer("✅ Ссылка отправлена!")
+    await call.message.answer("✅ Ссылка опубликована в канале!")
 
 
 # ─── Search ────────────────────────────────────────────────────────────────────
