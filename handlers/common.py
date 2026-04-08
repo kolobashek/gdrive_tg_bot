@@ -85,8 +85,8 @@ async def cmd_auth(event: Message | CallbackQuery, state: FSMContext):
         "🔑 <b>Авторизация Google</b>\n\n"
         "1. Перейдите по ссылке:\n"
         f"<a href='{url}'>Открыть Google OAuth</a>\n\n"
-        "2. Разрешите доступ и скопируйте код.\n"
-        "3. Отправьте код сюда."
+        "2. Разрешите доступ — вас перенаправит на localhost (страница не откроется).\n"
+        "3. Скопируйте полный URL из адресной строки браузера и отправьте его сюда."
     )
     await state.set_state(AuthStates.waiting_for_code)
 

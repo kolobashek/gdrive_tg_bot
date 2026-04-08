@@ -61,18 +61,32 @@ class GoogleAuthService:
             include_granted_scopes="true",
             prompt="consent",
         )
+        logger.info(f"Auth URL scopes requested: {SCOPES}")
         self._flows[user_id] = flow
         return auth_url
 
     def exchange_code(self, user_id: int, code: str) -> bool:
-        """Exchange auth code for tokens."""
+        """Exchange auth code for tokens. Accepts either a bare code or a full redirect URL."""
         flow = self._flows.get(user_id)
         if not flow:
             logger.error(f"No flow found for user {user_id}")
             return False
+        # Support pasting the full redirect URL (http://localhost?code=...&...)
+        if code.startswith("http"):
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(code)
+            params = parse_qs(parsed.query)
+            granted_scope = params.get("scope", ["(not returned)"])[0]
+            logger.info(f"Redirect URL granted scope: {granted_scope}")
+            codes = params.get("code")
+            if not codes:
+                logger.error(f"No 'code' param found in URL. Full URL: {code[:200]}")
+                return False
+            code = codes[0]
         try:
             flow.fetch_token(code=code)
             creds = flow.credentials
+            logger.info(f"Token scopes after exchange: {creds.scopes}")
             self._tokens[user_id] = {
                 "token": creds.token,
                 "refresh_token": creds.refresh_token,

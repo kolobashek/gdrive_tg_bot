@@ -20,6 +20,22 @@ from services.google_drive import GoogleDriveService, MIME_FOLDER
 router = Router()
 logger = logging.getLogger(__name__)
 
+# Short-lived cache for Drive page tokens (key → token string)
+_page_token_cache: dict[str, str] = {}
+_page_token_counter = 0
+
+
+def _store_page_token(token: str) -> str:
+    global _page_token_counter
+    _page_token_counter += 1
+    key = str(_page_token_counter)
+    _page_token_cache[key] = token
+    return key
+
+
+def _pop_page_token(key: str) -> str | None:
+    return _page_token_cache.pop(key, None)
+
 EMOJI = {
     "folder": "📁",
     "image": "🖼️",
@@ -79,7 +95,8 @@ def build_file_list_keyboard(files: list[dict], folder_id: str, next_token: str 
     if folder_id != "root":
         nav.append(InlineKeyboardButton(text="⬆️ Назад", callback_data="drive_root"))
     if next_token:
-        nav.append(InlineKeyboardButton(text="➡️ Ещё", callback_data=f"drive_next:{folder_id}:{next_token}"))
+        token_key = _store_page_token(next_token)
+        nav.append(InlineKeyboardButton(text="➡️ Ещё", callback_data=f"drive_next:{folder_id}:{token_key}"))
     if nav:
         buttons.append(nav)
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")])
@@ -148,7 +165,11 @@ async def open_folder(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("drive_next:"))
 async def next_page(call: CallbackQuery):
-    _, folder_id, token = call.data.split(":", 2)
+    _, folder_id, token_key = call.data.split(":", 2)
+    token = _pop_page_token(token_key)
+    if not token:
+        await call.answer("Страница устарела, обновите список.", show_alert=True)
+        return
     creds = auth_service.get_credentials(call.from_user.id)
     drive = GoogleDriveService(creds)
     result = drive.list_files(folder_id=folder_id, page_size=15, page_token=token)

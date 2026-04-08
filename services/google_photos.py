@@ -27,6 +27,8 @@ class GooglePhotosService:
         if resp.status_code == 401:
             self._refresh_token()
             resp = self._session.get(url, params=params)
+        if not resp.ok:
+            logger.error(f"Photos API GET {url} → {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
         return resp.json()
 
@@ -35,6 +37,8 @@ class GooglePhotosService:
         if resp.status_code == 401:
             self._refresh_token()
             resp = self._session.post(url, json=json_data)
+        if not resp.ok:
+            logger.error(f"Photos API POST {url} → {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
         return resp.json()
 
