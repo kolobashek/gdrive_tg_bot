@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 MIME_FOLDER = "application/vnd.google-apps.folder"
 
-FILE_FIELDS = "id, name, mimeType, size, modifiedTime, webViewLink, thumbnailLink, parents"
+FILE_FIELDS = "id, name, mimeType, size, modifiedTime, webViewLink, thumbnailLink, parents, md5Checksum"
 
 
 class GoogleDriveService:
@@ -150,10 +150,10 @@ class GoogleDriveService:
             params["pageToken"] = page_token
         return self.service.files().list(**params).execute()
 
-    def list_new_files_since(self, folder_id: str, since_token: str | None) -> tuple[list[dict], str]:
+    def list_new_files_since(self, since_token: str | None) -> tuple[list[dict], str]:
         """
         Returns (new_files, new_page_token).
-        Uses Drive changes API with page token for efficient polling.
+        Returns ALL changed files — caller filters by folder/mime as needed.
         """
         if not since_token:
             resp = self.service.changes().getStartPageToken().execute()
@@ -164,15 +164,15 @@ class GoogleDriveService:
         while True:
             resp = self.service.changes().list(
                 pageToken=token,
-                fields="nextPageToken, newStartPageToken, changes(fileId, file, removed)",
+                fields=f"nextPageToken, newStartPageToken, changes(fileId, removed, file({FILE_FIELDS}))",
                 spaces="drive",
             ).execute()
 
             for change in resp.get("changes", []):
                 if change.get("removed"):
                     continue
-                f = change.get("file", {})
-                if f and folder_id in f.get("parents", []):
+                f = change.get("file")
+                if f:
                     all_changes.append(f)
 
             if "newStartPageToken" in resp:
